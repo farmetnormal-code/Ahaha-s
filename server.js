@@ -1,76 +1,106 @@
-const net = require('net');
+const http = require('http');
+const url = require('url');
 
-// Порт, на котором будет работать сервер (по умолчанию 25565)
-const PORT = process.env.PORT || 25565;
+// Порт, на котором будет работать сервер (по умолчанию 8080 для Fly.io)
+const PORT = process.env.PORT || 8080;
 
-let waitingClient = null;
-const rooms = new Map(); // Здесь храним пары игроков: Игрок -> его Соперник
+let waitingClient = null; // { id: '123456', time: Date.now() }
+const rooms = new Map(); // id -> { role: 1 или 2, partner: '654321', moves: null }
 
-const server = net.createServer((socket) => {
-    console.log('Новое подключение с IP:', socket.remoteAddress);
-    socket.setEncoding('utf8');
-    let buffer = '';
+const server = http.createServer((req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
 
-    socket.on('data', (data) => {
-        buffer += data;
-        let lines = buffer.split('\n');
-        buffer = lines.pop(); // Остаток неполной строки оставляем в буфере
+    const parsedUrl = url.parse(req.url, true);
+    const pathname = parsedUrl.pathname;
+    const query = parsedUrl.query;
+    const id = query.id;
 
-        for (let line of lines) {
-            line = line.trim();
-            if (!line) continue;
+    if (!id) {
+        res.writeHead(400);
+        return res.end('Missing ID');
+    }
 
-            // Если игрок нажал "ИСКАТЬ БОЙ"
-            if (line === 'SEARCH') {
-                console.log('Игрок ищет матч...');
-                if (waitingClient === null || waitingClient === socket || waitingClient.destroyed) {
-                    waitingClient = socket;
-                } else {
-                    // Нашли пару!
-                    const player1 = waitingClient;
-                    const player2 = socket;
-                    waitingClient = null;
+    // Очистка старого ожидающего игрока, если он завис более чем на 60 секунд
+    if (waitingClient && Date.now() - waitingClient.time > 60000) {
+        waitingClient = null;
+    }
 
-                    // Связываем их друг с другом в комнату
-                    rooms.set(player1, player2);
-                    rooms.set(player2, player1);
-
-                    // Отправляем роли, чтобы телефоны запустили игру
-                    player1.write('MATCH:1\n');
-                    player2.write('MATCH:2\n');
-                    console.log('Матч найден! Игроки соединены в комнату.');
-                }
-            } 
-            // Если игрок сделал ход и отправил данные атак
-            else if (line.startsWith('TURN:')) {
-                const partner = rooms.get(socket);
-                if (partner && !partner.destroyed) {
-                    partner.write(line + '\n'); // Просто пересылаем ход сопернику
-                }
-            }
+    // Если игрок нажал "ИСКАТЬ БОЙ" (или периодически опрашивает статус поиска)
+    if (pathname === '/search') {
+        console.log(`Игрок ${id} ищет матч...`);
+        
+        // Если игрок уже соединен в комнату
+        if (rooms.has(id)) {
+            const room = rooms.get(id);
+            res.writeHead(200);
+            return res.end(`MATCH:${room.role}`);
         }
-    });
 
-    // Если игрок закрыл игру, отключился или пропал интернет
-    socket.on('close', () => {
-        console.log('Игрок отключился');
-        if (waitingClient === socket) {
+        // Если комната еще не найдена и в очереди никого нет (или это тот же игрок)
+        if (!waitingClient || waitingClient.id === id) {
+            waitingClient = { id: id, time: Date.now() };
+            res.writeHead(200);
+            return res.end('WAIT');
+        } else {
+            // Нашли пару!
+            const partnerId = waitingClient.id;
+            waitingClient = null;
+
+            rooms.set(partnerId, { role: 1, partner: id, moves: null });
+            rooms.set(id, { role: 2, partner: partnerId, moves: null });
+
+            console.log(`Матч найден! Игрок 1 (${partnerId}) против Игрока 2 (${id})`);
+            res.writeHead(200);
+            return res.end('MATCH:2');
+        }
+    } 
+    // Если игрок сделал ход и отправляет данные атак
+    else if (pathname === '/turn') {
+        const data = query.data || '';
+        const room = rooms.get(id);
+        if (room && room.partner && rooms.has(room.partner)) {
+            const partnerRoom = rooms.get(room.partner);
+            partnerRoom.moves = data; // Сохраняем ход для соперника
+            console.log(`Ход от ${id} передан партнёру ${room.partner}`);
+        }
+        res.writeHead(200);
+        return res.end('OK');
+    } 
+    // Опрос входящих ходов от соперника
+    else if (pathname === '/check') {
+        const room = rooms.get(id);
+        if (room && room.moves !== null) {
+            const movesData = room.moves;
+            room.moves = null; // Очищаем буфер после чтения
+            res.writeHead(200);
+            return res.end(`TURN:${movesData}`);
+        }
+        res.writeHead(200);
+        return res.end('WAIT');
+    } 
+    // Отключение или выход в меню
+    else if (pathname === '/disconnect') {
+        if (waitingClient && waitingClient.id === id) {
             waitingClient = null;
         }
-        const partner = rooms.get(socket);
-        if (partner) {
-            rooms.delete(partner);
-            rooms.delete(socket);
-            partner.destroy(); // Разрываем связь у соперника, т.к. бой окончен
+        if (rooms.has(id)) {
+            const room = rooms.get(id);
+            if (room.partner && rooms.has(room.partner)) {
+                rooms.delete(room.partner);
+            }
+            rooms.delete(id);
         }
-    });
-
-    socket.on('error', (err) => {
-        console.log('Ошибка сокета:', err.message);
-    });
+        res.writeHead(200);
+        return res.end('OK');
+    } 
+    else {
+        res.writeHead(404);
+        return res.end('Not Found');
+    }
 });
 
-// Запускаем сервер
+// Запускаем HTTP-сервер
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Игровой сервер матчмейкинга успешно запущен на порту ${PORT}!`);
+    console.log(`Игровой HTTP-сервер матчмейкинга успешно запущен на порту ${PORT}!`);
 });
