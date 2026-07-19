@@ -8,13 +8,20 @@ primary_region = 'iad'
 
 [build]
 
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = 'stop'
+[env]
+  PORT = "25565"
+
+[[services]]
+  internal_port = 25565
+  protocol = "tcp"
+  auto_stop_machines = "stop"
   auto_start_machines = true
   min_machines_running = 0
-  processes = ['app']
+
+  [[services.ports]]
+    port = 80
+    handlers = []
+
 
 [[vm]]
   memory = '1gb'
